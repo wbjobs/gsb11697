@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>实例化渲染性能对比 · 10 万物体</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>实例化渲染对比实验 <span class="sub">WebGL + Web Worker + PerformanceObserver + TypedArray</span></h1>
+</header>
+
+<main>
+  <section id="stage">
+    <canvas id="glcanvas"></canvas>
+    <div id="fallback-banner" class="hidden"></div>
+    <canvas id="fpschart" width="260" height="60"></canvas>
+  </section>
+
+  <aside id="panel">
+    <fieldset>
+      <legend>渲染方案</legend>
+      <label><input type="radio" name="mode" value="naive"> 逐物体绘制（每物体 1 次 draw call）</label>
+      <label><input type="radio" name="mode" value="batched"> 批处理（CPU 合并顶点，1 次 draw call）</label>
+      <label><input type="radio" name="mode" value="instanced" checked> 实例化（gl.drawArraysInstanced）</label>
+      <label class="dim"><input type="checkbox" id="capNaive" checked> 朴素模式绘制数上限 2 万（防卡死）</label>
+    </fieldset>
+
+    <fieldset>
+      <legend>物体数量：<b id="countLabel">100000</b></legend>
+      <input type="range" id="countSlider" min="1000" max="200000" step="1000" value="100000">
+      <div class="row">
+        <button id="addBtn">+ 增加 5000</button>
+        <button id="removeBtn">− 删除 5000</button>
+        <button id="resetBtn">重置 10 万</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>显存预算（模拟）：<b id="vramLabel">256</b> MB</legend>
+      <input type="range" id="vramSlider" min="1" max="512" step="1" value="256">
+      <div class="dim">实例缓冲超出预算或 gl.OUT_OF_MEMORY 时自动降级到批处理</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>实时指标</legend>
+      <table id="liveStats">
+        <tr><td>当前方案</td><td id="stMode">-</td></tr>
+        <tr><td>FPS</td><td id="stFps">-</td></tr>
+        <tr><td>帧耗时</td><td id="stFrame">-</td></tr>
+        <tr><td>JS 提交耗时</td><td id="stSubmit">-</td></tr>
+        <tr><td>Draw Call 次数</td><td id="stDraws">-</td></tr>
+        <tr><td>实例数</td><td id="stCount">-</td></tr>
+        <tr><td>GPU 缓冲占用</td><td id="stVram">-</td></tr>
+        <tr><td>长任务 (&gt;50ms)</td><td id="stLongtask">-</td></tr>
+      </table>
+    </fieldset>
+
+    <fieldset>
+      <legend>三方案对照（自动记录）</legend>
+      <table id="compareTable">
+        <thead><tr><th>方案</th><th>FPS</th><th>帧 ms</th><th>提交 ms</th><th>Draws</th></tr></thead>
+        <tbody>
+          <tr id="row-naive"><td>逐物体</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
+          <tr id="row-batched"><td>批处理</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
+          <tr id="row-instanced"><td>实例化</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
+        </tbody>
+      </table>
+    </fieldset>
+  </aside>
+</main>
+
+<!-- 模拟器源码：以 Blob 方式创建 Worker，file:// 直接打开也能运行 -->
+<script id="sim-worker-src" type="text/js-worker">
+'use strict';
+// 每个实例 7 个 float：offsetX offsetY scale rotation colorR colorG colorB
+const FLOATS_PER_INSTANCE = 7;
+let capacity = 0;
+let count = 0;
+let pos, vel, scale, rot, rotVel, color;
+
+function alloc(cap) {
+  capacity = cap;
+  pos = new Float32Array(cap * 2);
+  vel = new Float32Array(cap * 2);
+  scale = new Float32Array(cap);
+  rot = new Float32Array(cap);
+  rotVel = new Float32Array(cap);
+  color = new Float32Array(cap * 3);
+}
+
+function grow(newCap) {
+  const o = { pos, vel, scale, rot, rotVel, color };
+  alloc(newCap);
+  pos.set(o.pos); vel.set(o.vel); scale.set(o.scale);
+  rot.set(o.rot); rotVel.set(o.rotVel); color.set(o.color);
+}
+
+function spawnOne(i) {
+  pos[i * 2] = (Math.random() * 2 - 1) * 1.6;
+  pos[i * 2 + 1] = (Math.random() * 2 - 1);
+  const a = Math.random() * Math.PI * 2;
+  const s = 0.15 + Math.random() * 0.45;
+  vel[i * 2] = Math.cos(a) * s;
+  vel[i * 2 + 1] = Math.sin(a) * s;
+  scale[i] = 0.004 + Math.random() * 0.012;
+  rot[i] = Math.random() * Math.PI * 2;
+  rotVel[i] = (Math.random() - 0.5) * 3;
+  color[i * 3] = 0.3 + Math.random() * 0.7;
+  color[i * 3 + 1] = 0.3 + Math.random() * 0.7;
+  color[i * 3 + 2] = 0.3 + Math.random() * 0.7;
+}
+
+function setCount(n) {
+  if (n > capacity) grow(Math.max(n, capacity * 2, 1024));
+  if (n > count) {
+    for (let i = count; i < n; i++) spawnOne(i);
+  }
+  count = n;
+}
+
+self.onmessage = (e) => {
+  const msg = e.data;
+  switch (msg.type) {
+    case 'init':
+      alloc(Math.max(msg.count, 1024));
+      count = 0;
+      setCount(msg.count);
+      postMessage({ type: 'ready', count });
+      break;
+    case 'setCount':
+      setCount(Math.max(0, msg.count));
+      postMessage({ type: 'count', count });
+      break;
+    case 'tick': {
+      const dt = Math.min(msg.dt, 0.05);
+      const out = new Float32Array(msg.buffer);
+      const W = 1.6, H = 1.0;
+      for (let i = 0; i < count; i++) {
+        let x = pos[i * 2] + vel[i * 2] * dt;
+        let y = pos[i * 2 + 1] + vel[i * 2 + 1] * dt;
+        if (x < -W || x > W) { vel[i * 2] *= -1; x = Math.max(-W, Math.min(W, x)); }
+        if (y < -H || y > H) { vel[i * 2 + 1] *= -1; y = Math.max(-H, Math.min(H, y)); }
+        pos[i * 2] = x; pos[i * 2 + 1] = y;
+        rot[i] += rotVel[i] * dt;
+        const o = i * FLOATS_PER_INSTANCE;
+        out[o] = x; out[o + 1] = y;
+        out[o + 2] = scale[i];
+        out[o + 3] = rot[i];
+        out[o + 4] = color[i * 3]; out[o + 5] = color[i * 3 + 1]; out[o + 6] = color[i * 3 + 2];
+      }
+      postMessage({ type: 'frame', buffer: out.buffer, count }, [out.buffer]);
+      break;
+    }
+  }
+};
+</script>
+
+<script src="js/renderer.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
